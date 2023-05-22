@@ -1,0 +1,1958 @@
+---
+title: "Regularization methods for high-dimensional data as a tool for seafood traceability"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true 
+    theme: united
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Welcome
+
+This is an R notebook written to support the paper _Bispo et al. (2023) Regularization methods for high-dimensional data as a tool for seafood traceability_. The main goal is to present the source code behind the study. 
+
+This work is funded by national funds through the FCT - Fundação para a Ciência e a Tecnologia, I.P., under the scope of the projects UIDB/00297/2020 and UIDP/00297/2020.
+
+
+# Session info
+
+```{r session info}
+cat(paste("#",capture.output(sessionInfo()), "\n", collapse =""))
+```
+
+# Packages 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy = TRUE,
+	eval = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	comment = " ",
+	include = TRUE
+)
+
+library(knitr)
+library(glmnet)
+library(tidyverse)
+library(ggplot2)
+library(ensr)
+library(caret)
+library(e1071)
+library(dplyr)
+library(plyr)
+library(MLmetrics)
+library(ggpubr)
+library(glmnetUtils)
+library(ROCR)
+library(PRROC)
+library(ggplotify)
+library(MASS)
+library(here)
+library(corrplot)
+library(dplyr)
+library(gridExtra)
+library(kableExtra)
+
+```
+
+# Define Functions
+
+```{r}
+# Log-Loss
+MultiLogLoss2 <- function (y_true, y_pred){
+  if (is.factor(y_true)) {
+    y_true_mat <- matrix(0, nrow = length(y_true), ncol = length(levels(y_true)))
+    sample_levels <- as.integer(y_true)
+    for (i in 1:length(y_true)) y_true_mat[i, sample_levels[i]] <- 1
+    y_true <- y_true_mat
+  }
+  eps <- 1e-20
+  N <- dim(y_pred)[1]
+  y_pred <- pmax(pmin(y_pred, 1 - eps), eps)
+  MultiLogLoss2 <- (-1/N) * sum(y_true * log(y_pred))
+  return(MultiLogLoss2)
+}
+
+# Standard Error of the Mean
+sem <- function(x) sd(x)/sqrt(length(x))
+
+```
+
+
+# Dataset
+
+```{r}
+data <- as.data.frame(readxl::read_xlsx("DataClams.xlsx", col_names = TRUE))
+data_scaled<-cbind(data[,1],as.data.frame(scale(data[,2:45])))
+```
+
+
+# Monte Carlo Cross-Validation
+
+A 1000 iteration Monte Carlo Cross-Validation was implemented by constructing 1000 testing and training sets at random, hence fitting 1000 distinct models for each regularization method. The training/testing ratio was 80%/20%.
+
+```{r}
+size <- floor(0.8*nrow(data_scaled)) # Number of train observations
+M <- 1000 # Number of Monte Carlo iterations
+train_ind <- list() # Index of training observations
+x_train <- list() # Training sets 
+y_train <- list() # Training sets - response variable
+x_test <- list() # Testing sets 
+y_test <- list() # Testing sets - response variable 
+
+for (i in 1:M) {
+  set.seed(i*100)
+  train_ind[[i]]<-sample(seq_len(nrow(data_scaled)),size=size)
+  x_train[[i]]<-data_scaled[train_ind[[i]],2:45]
+  y_train[[i]]<-data_scaled[train_ind[[i]],1]
+  x_test[[i]]<-data_scaled[-train_ind[[i]],2:45]
+  y_test[[i]]<-data_scaled[-train_ind[[i]],1]
+}
+
+```
+
+
+# Regularization Methods
+
+## Ridge
+
+K-fold Cross-Validation was used to find optimal penalization parameter. By doing so, two possible penalization parameters are estimated: "lambda.min" and "lambda.1se". Ridge model was implemented considering "lambda.min".
+
+```{r}
+fit.ridge.cv <- list() # Cross-Validation to estimate penalization parameters
+lambda_ridge <- data.frame(nrow=M,ncol = 2) # Dataframe with the 2 estimated possible penalization parameters
+names(lambda_ridge) <- c("lambda.min", "lambda.1se")
+
+# WARNING : slow algorithm 
+for (i in 1:M) {
+  set.seed(i) 
+  fit.ridge.cv[[i]] <- cv.glmnet(as.matrix(x_train[[i]]),
+                                 y_train[[i]],
+                                 nfolds = 5,
+                                 type.measure = "class", 
+                                 alpha = 0, grouped = FALSE,
+                                 family = "multinomial")
+  lambda_ridge[i,1]<-fit.ridge.cv[[i]]$lambda.min
+  lambda_ridge[i,2]<-fit.ridge.cv[[i]]$lambda.1se
+}
+
+```
+
+The code below allows to inspect the visual representation behind the process of estimating the penalization parameter of the 1st Monte Carlo Cross-Validation iteration Ridge model.
+
+```{r}
+plot(fit.ridge.cv[[1]])
+```
+
+The following code was used to analyze the coefficient shrinkage behavior as a function of penalization values.
+
+```{r}
+
+ridgeFit <- list() # the i-th element of this object contains the information of a series of Ridge models fit with the i-th training set, but considering different penalization values
+
+for (i in 1:M) {
+  
+  ridgeFit[[i]]<-glmnet(as.matrix(x_train[[i]]),
+                        y_train[[i]],
+                        alpha = 0,
+                        lambda = fit.ridge.cv[[i]]$lambda,
+                        family = "multinomial")
+}
+
+```
+
+Bellow is displayed the coefficient shrinkage considering different penalization values, for the 1st iteration Ridge model, for each class of the response (G - Ría de Vigo, Rav - Ria de Aveiro, T - Tagus Estuary).
+
+```{r}
+
+plot(ridgeFit[[1]], xvar="lambda",label=T, 
+     ylim=c(-0.07,0.07), col="black",
+     cex.lab=1, cex.axis=1) 
+
+```
+
+
+The next chunk fits Ridge models for each iteration of Monte Carlo Cross-Validation.
+
+```{r}
+
+fit.ridge.best <- list() # model with ideal penalization
+fit.ridge.pred <- list() # predicted probabilities
+fit.ridge.pred.class <- list() # predicted classes
+fit.ridge.coef <- list() # estimated coefficients
+
+non_zero_coef_ridge <- vector() # counts how many coefficients were estimated by the model
+
+
+for (i in 1:M) {
+  
+  fit.ridge.best[[i]] <- glmnet(as.matrix(x_train[[i]]), 
+                                y_train[[i]], 
+                                alpha = 0, 
+                                lambda = fit.ridge.cv[[i]]$lambda.min,
+                                family = "multinomial")
+  
+  
+  fit.ridge.pred[[i]] <- predict(fit.ridge.best[[i]],
+                                 newx = as.matrix(x_test[[i]]), 
+                                 type = "response")
+  fit.ridge.pred.class[[i]] <- predict(fit.ridge.best[[i]],
+                                       as.matrix(x_test[[i]]), 
+                                       type = "class")
+  fit.ridge.coef[[i]] <- coef(fit.ridge.best[[i]])
+  
+  non_zero_coef_ridge[i] <- sum(fit.ridge.coef[[i]]$G>0)+sum(fit.ridge.coef[[i]]$Rav>0)+
+    sum(fit.ridge.coef[[i]]$T>0)+sum(fit.ridge.coef[[i]]$G<0)+
+    sum(fit.ridge.coef[[i]]$Rav<0)+sum(fit.ridge.coef[[i]]$T<0)
+  
+}
+
+```
+
+
+## LASSO
+
+K-fold Cross-Validation was used to estimate optimal penalization parameter. By doing so, two possible penalization parameters are estimated: "lambda.min" and "lambda.1se". LASSO model was implemented considering "lambda.min".
+
+```{r}
+
+fit.lasso.cv <- list() # Cross-Validation to estimate penalization parameters
+lambda_lasso <- data.frame(nrow=M, ncol = 2) # Dataframe with the 2 estimated possible penalization parameters
+names(lambda_lasso) <- c("lambda.min", "lambda.1se")
+
+# WARNING : slow algorithm 
+
+for (i in 1:M) {
+  
+  set.seed(i) 
+  fit.lasso.cv[[i]] <- cv.glmnet(as.matrix(x_train[[i]]),
+                                 y_train[[i]],
+                                 nfolds = 5,
+                                 type.measure = "class", 
+                                 alpha = 1, grouped = FALSE,
+                                 family = "multinomial")
+  lambda_lasso[i,1]<-fit.lasso.cv[[i]]$lambda.min
+  lambda_lasso[i,2]<-fit.lasso.cv[[i]]$lambda.1se
+  
+}
+
+```
+
+Bellow see the visual representation behind the process of estimating the penalization parameter of the 1st Monte Carlo Cross-Validation iteration LASSO model.
+
+```{r}
+plot(fit.lasso.cv[[1]]) 
+```
+
+The following code was used to analyze the coefficient shrinkage behaviour as we change the penalization values.
+
+```{r}
+
+lassoFit <- list() # the i-th element of this object contains the information of a series of LASSO models fit with the i-th training set, but considering different penalization values
+
+for (i in 1:M) {
+  
+  lassoFit[[i]]<-glmnet(as.matrix(x_train[[i]]),
+                        y_train[[i]],
+                        alpha = 1,
+                        lambda = fit.lasso.cv[[i]]$lambda,
+                        family = "multinomial")
+}
+
+```
+
+Bellow is displayed the coefficient shrinkage considering different penalization values, for the 1st iteration LASSO model, for each class of the response (G - Ría de Vigo, Rav - Ria de Aveiro, T - Tagus Estuary).
+
+```{r}
+
+plot(lassoFit[[1]], xvar="lambda",label=T, 
+     col="black", ylim=c(-2.5,2),
+     cex.lab=1, cex.axis=1) 
+
+```
+
+
+The next chunk fits LASSO models for each iteration of Monte Carlo Cross-Validation.
+
+```{r}
+
+fit.lasso.best <- list() # model with ideal penalization
+fit.lasso.pred <- list() # predicted probabilities
+fit.lasso.pred.class <- list() # predicted classes
+fit.lasso.coef <- list() # estimated coefficients
+
+non_zero_coef_lasso <- vector() # counts how many coefficients were estimated by the model
+
+
+for (i in 1:M) {
+  
+  fit.lasso.best[[i]] <- glmnet(as.matrix(x_train[[i]]), 
+                                y_train[[i]], 
+                                alpha = 1, 
+                                lambda = fit.lasso.cv[[i]]$lambda.min,
+                                family = "multinomial")
+  fit.lasso.pred[[i]] <- predict(fit.lasso.best[[i]],
+                                 newx = as.matrix(x_test[[i]]), 
+                                 type = "response")
+  fit.lasso.pred.class[[i]] <- predict(fit.lasso.best[[i]],
+                                       as.matrix(x_test[[i]]), 
+                                       type = "class")
+  fit.lasso.coef[[i]] <- coef(fit.lasso.best[[i]])
+  
+  non_zero_coef_lasso[i] <- sum(fit.lasso.coef[[i]]$G>0)+
+    sum(fit.lasso.coef[[i]]$Rav>0)+
+    sum(fit.lasso.coef[[i]]$T>0)+
+    sum(fit.lasso.coef[[i]]$G<0)+
+    sum(fit.lasso.coef[[i]]$Rav<0)+
+    sum(fit.lasso.coef[[i]]$T<0)
+  
+}
+
+```
+
+Next we studied the frequency of the number of variable coefficients LASSO estimated throughout the 1000 models.
+
+```{r}
+
+table_selected_lasso <- as.data.frame(table(non_zero_coef_lasso))
+ggplot(table_selected_lasso, aes(x=non_zero_coef_lasso, y=Freq)) + 
+  geom_bar(stat = "identity",fill = "white", colour="black", width = 0.6) + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab("Number of variable coefficients estimated") + ylab("Frequency") 
+
+```
+
+
+## ELASTIC NET
+
+K-fold Cross-Validation was used to estimate the optimal penalization and mixing parameters. 
+
+```{r}
+
+model <- list() # Cross-Validation to estimate penalization and mixing parameters simultaneously
+model_besttune <- list() # Estimated penalization and mixing parameters
+
+
+# WARNING : SLOW
+
+for (i in 1:M) {
+  
+  set.seed(i)
+  model[[i]] <- train(x= as.matrix(x_train[[i]]),
+                      y=y_train[[i]], 
+                      method = "glmnet",
+                      metric="Accuracy",
+                      trControl = trainControl("cv", number = 5),
+                      tuneLength = 10)
+  model_besttune[[i]] <- model[[i]]$bestTune
+}
+
+```
+
+The next chunk allows to check on the estimated penalization and mixing parameters for the first 6 Monte Carlo Cross-Validation iterations of Elastic Net models.
+
+```{r}
+
+head(model_besttune, 6)
+
+```
+
+
+The next chunk fits Elastic net models.
+
+```{r}
+
+fit.en.cv <- list() # Cross-Validation to estimate penalization parameters
+
+lambda_en <- data.frame(nrow = M, ncol = 2) # Dataframe with the 2 alternative estimated penalization parameters
+
+names(lambda_en) <- c("lambda.min", "lambda.1se")
+
+for (i in 1:M) {
+  
+  set.seed(i) 
+  fit.en.cv[[i]] <- cv.glmnet(as.matrix(x_train[[i]]),
+                              y_train[[i]],
+                              nfolds = 5,
+                              type.measure = "class", 
+                              alpha = model_besttune[[i]]$alpha,
+                              grouped = FALSE,
+                              family = "multinomial")
+  lambda_en[i,1]<-fit.en.cv[[i]]$lambda.min
+  lambda_en[i,2]<-fit.en.cv[[i]]$lambda.1se
+  
+}
+
+```
+
+The following code was used to analyze the coefficient shrinkage behavior as a function of the penalization values.
+
+```{r}
+
+enFit <- list() # the i-th element of this object contains the information of a series of Elastic Net models fit with the i-th training set, but considering different penalization values
+
+for (i in 1:M) {
+  
+  enFit[[i]]<-glmnet(as.matrix(x_train[[i]]),
+                     y_train[[i]],
+                     alpha = model_besttune[[i]]$alpha,
+                     lambda = fit.en.cv[[i]]$lambda,
+                     family = "multinomial")
+}
+
+```
+
+Bellow is displayed the coefficient shrinkage considering different penalization values, for the 1st iteration Elastic Net model, for each class of the response (G - Ría de Vigo, Rav - Ria de Aveiro, T - Tagus Estuary).
+
+```{r}
+
+plot(enFit[[1]], xvar="lambda",label=T, ylim=c(-0.7,0.7),
+     col="black", cex.lab=1, cex.axis=1)
+
+```
+
+Considering the optimal penalization and mixing parameters in object "model_besttune", we were able to fit the ideal Elastic Net models for each iteration of Monte Carlo Cross-Validation.
+
+
+```{r}
+
+fit.en.best <- list() # model with ideal penalization
+fit.en.pred <- list() # predicted probabilities
+fit.en.pred.class <- list() # predicted classes
+fit.en.coef <- list() # estimated coefficients
+
+non_zero_coef_en <- vector() # counts how many coefficients were estimated by the model
+
+for (i in 1:M) {
+  
+  fit.en.best[[i]] <- glmnet(as.matrix(x_train[[i]]),
+                             y_train[[i]], 
+                             alpha = model_besttune[[i]]$alpha, 
+                             lambda = model_besttune[[i]]$lambda,
+                             family = "multinomial")
+  fit.en.pred[[i]] <- predict(fit.en.best[[i]],
+                              newx = as.matrix(x_test[[i]]),
+                              type = "response")
+  fit.en.pred.class[[i]] <- predict(fit.en.best[[i]],
+                                    as.matrix(x_test[[i]]), 
+                                    type = "class")
+  fit.en.coef[[i]] <- coef(fit.en.best[[i]])
+  
+  non_zero_coef_en[i] <-  sum(fit.en.coef[[i]]$G>0) + 
+    sum(fit.en.coef[[i]]$Rav>0) +
+    sum(fit.en.coef[[i]]$T>0)+
+    sum(fit.en.coef[[i]]$G<0)+
+    sum(fit.en.coef[[i]]$Rav<0)+
+    sum(fit.en.coef[[i]]$T<0)
+  
+}
+
+```
+
+We studied the frequency of the number of variable coefficients Elastic Net estimated throughout the 1000 models.
+
+```{r}
+
+table_selected_en <- as.data.frame(table(non_zero_coef_en))
+ggplot(table_selected_en, aes(x=non_zero_coef_en, y=Freq)) + 
+  geom_bar(stat = "identity", fill="white", colour="black", width = 0.6) + theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  xlab("Number of variable coefficients estimated") + ylab("Frequency")
+
+
+```
+
+```{r,fig.width=5}
+
+
+cuts=seq(0,75,10)
+t1=table(cut(non_zero_coef_lasso,breaks =cuts))
+plot(cut(non_zero_coef_lasso,breaks =cuts))
+
+t2=table(cut(non_zero_coef_en,breaks =cuts))
+plot(cut(non_zero_coef_en,breaks =cuts))
+
+prop.table(t2)
+
+```
+
+
+# Model Validation 
+
+Model validation is the process of confirming that the outputs of the fitted models are approved as performing correctly according to the testing sets.
+
+## Cross Entropy
+
+This method of validation takes the affiliation probabilities into consideration. For the purpose of model validation, we study Cross Entropy on the testing sets, but this measure can also allow significant conclusions when computed on the training sets.
+
+### Training Cross Entropy
+
+To analyze training Cross Entropy, we computed the predicted probabilities of class affiliation of the training sets' observations, considering the different methods of regularization.
+
+```{r}
+
+fit.ridge.pred.ra <- list() # Ridge's predicted probabilities of class affiliation of the training sets' observations
+fit.lasso.pred.ra <- list()# LASSO's predicted probabilities of class affiliation of the training sets' observations
+fit.en.pred.ra <- list() # Elastic Net's predicted probabilities of class affiliation of the training sets' observations
+
+for (i in 1:M) {
+  fit.ridge.pred.ra[[i]] <- as.data.frame(predict(fit.ridge.best[[i]],
+                                                  newx = as.matrix(x_train[[i]]), 
+                                                  type = "response"))
+  
+  
+  fit.lasso.pred.ra[[i]] <- as.data.frame(predict(fit.lasso.best[[i]],
+                                                  newx = as.matrix(x_train[[i]]), 
+                                                  type = "response"))
+  
+  fit.en.pred.ra[[i]] <- as.data.frame(predict(fit.en.best[[i]],
+                                               newx = as.matrix(x_train[[i]]), 
+                                               type = "response"))
+}
+
+```
+
+After establishing the predictive probabilities in each class of the response variable, we the calculated the Cross Entropy (or Log-Loss) values.
+
+```{r}
+
+logloss_model_ridge <- vector() # Ridge training cross entropy
+logloss_model_lasso <- vector() # LASSO training cross entropy
+logloss_model_en <- vector() # Elastic Net training cross entropy
+
+for (i in 1:M) {
+  logloss_model_ridge[i] <- MultiLogLoss2(y_pred = as.data.frame(fit.ridge.pred.ra[[i]]), 
+                                          y_true = as.factor(y_train[[i]]))
+  logloss_model_lasso[i] <- MultiLogLoss2(y_pred = as.data.frame(fit.lasso.pred.ra[[i]]), 
+                                          y_true = as.factor(y_train[[i]]))
+  logloss_model_en[i] <- MultiLogLoss2(y_pred = as.data.frame(fit.en.pred.ra[[i]]), 
+                                       y_true = as.factor(y_train[[i]]))
+}
+
+# Combining the training Cross Entropy results of each method into a dataframe:
+TOTAL_train_log_loss <- c(logloss_model_ridge,
+                          logloss_model_lasso,
+                          logloss_model_en)
+
+dat_train_log_loss = data.frame(y=TOTAL_train_log_loss, x=rep(1:1000,3), 
+                                Method=rep(c("Ridge","LASSO","Elastic Net"),
+                                           each=1000))
+dat_train_log_loss$Method <- factor(dat_train_log_loss$Method,
+                                    levels = c('Ridge','LASSO','Elastic Net'),
+                                    ordered = TRUE)
+
+```
+
+
+
+
+
+
+Bellow see the training Cross Entropy boxplots considering the different apllied methods of regularization.
+
+```{r}
+
+ggplot(dat_train_log_loss, aes(x=Method,y=y, group=Method)) +
+  geom_boxplot() +
+  scale_color_manual(values = c("black")) +
+  ylab("Cross Entropy") + theme_bw() +
+  theme(axis.text=element_text(size=10),
+        axis.title=element_text(size=12)) 
+
+```
+
+### Testing Cross Entropy 
+
+To analyze testing Cross Entropy, we computed the predicted probabilities of class affiliation of the testing sets' observations, considering the different methods of regularization. After establishing the predictive probabilities in each class of the response variable, we the calculated the Cross Entropy (or Log-Loss) values.
+
+```{r}
+
+y_pred_ridge <- list() # Ridge's predicted probabilities of class affiliation of the testing sets' observations
+y_pred_lasso <- list() # LASSO's predicted probabilities of class affiliation of the testing sets' observations
+y_pred_en <- list() # Elastic Net's predicted probabilities of class affiliation of the testing sets' observations
+
+logloss_ridge <- vector() # Ridge testing cross entropy
+logloss_lasso <- vector() # LASSO testing cross entropy
+logloss_en <- vector() # Elastic Net testing cross entropy
+
+
+for (i in 1:M) {
+  
+  # Ridge
+  y_pred_ridge[[i]] <- as.data.frame(fit.ridge.pred[[i]])
+  colnames(y_pred_ridge[[i]]) <- c("G","Rav","T")
+  logloss_ridge[i] <- MultiLogLoss2(y_pred = y_pred_ridge[[i]],
+                                    y_true = factor(y_test[[i]], levels = c("G","Rav","T")) )
+  
+  # LASSO
+  y_pred_lasso[[i]] <- as.data.frame(fit.lasso.pred[[i]])
+  colnames(y_pred_lasso[[i]]) <- c("G","Rav","T")
+  logloss_lasso[i] <- MultiLogLoss2(y_pred = y_pred_lasso[[i]],
+                                    y_true = factor(y_test[[i]], levels = c("G","Rav","T")) )
+  
+  # Elastic Net
+  y_pred_en[[i]] <- as.data.frame(fit.en.pred[[i]])
+  colnames(y_pred_en[[i]]) <- c("G","Rav","T")
+  logloss_en[i] <- MultiLogLoss2(y_pred = y_pred_en[[i]],
+                                 y_true = factor(y_test[[i]], levels = c("G","Rav","T")) )
+  
+}
+
+# Combining the training Cross Entropy results of each method into a dataframe:
+TOTAL_test_log_loss <- c(logloss_ridge,logloss_lasso,logloss_en)
+
+dat_log_loss = data.frame(y=TOTAL_test_log_loss, x=rep(1:1000,3), 
+                          Method=rep(c("Ridge","LASSO","Elastic Net"),
+                                     each=1000))
+dat_log_loss$Method <- factor(dat_log_loss$Method,
+                              levels = c('Ridge','LASSO','Elastic Net'),
+                              ordered = TRUE)
+
+```
+
+Bellow see the testing Cross Entropy boxplots considering the different apllied methods of regularization.
+
+```{r}
+
+ggplot(dat_log_loss, aes(x=Method,y=y, group=Method)) +
+  geom_boxplot() +
+  scale_color_manual(values = c("black")) +
+  ylab("Cross Entropy") + theme_bw() +
+  theme(axis.text=element_text(size=10),
+        axis.title=element_text(size=12))
+
+```
+
+
+
+## Confusion Matrices
+
+### Ridge
+
+Each Ridge model predicted the classes of their respective 6 test observations. For the confusion matrix analysis we merged the 1000 testing sets and the predicted classes made by the 1000 Ridge models. 
+
+
+```{r}
+df_y_test_total <- ldply(y_test,data.frame) # merged testing set of 6,000 test observations
+
+df_pred_class_ridge_total <- ldply(fit.ridge.pred.class,data.frame) # merged predicted classes made by the 1000 Ridge models
+
+```
+
+Bellow see Ridge's confusion matrix.
+
+```{r}
+
+TOTAL_confusion_matrix_ridge <- confusionMatrix(as.factor(df_pred_class_ridge_total$s0),              as.factor(df_y_test_total$X..i..))$table
+TOTAL_confusion_matrix_ridge # Ridge confusion matrix
+
+
+# confusionMatrix(table(fit.ridge.pred.class[[1]],y_test[[1]]))
+
+
+```
+
+Confusion matrices allow us to compute a few indicators: true positives, false positives, true negatives and false negatives
+
+```{r}
+
+# Ría de Vigo
+
+TOTAL_TP_G_ridge <- TOTAL_confusion_matrix_ridge[1,1] # True Positives
+
+TOTAL_FP_G_ridge <- TOTAL_confusion_matrix_ridge[1,2] + 
+  TOTAL_confusion_matrix_ridge[1,3] # False Positives
+
+TOTAL_TN_G_ridge <- TOTAL_confusion_matrix_ridge[2,2] + 
+  TOTAL_confusion_matrix_ridge[2,3] +
+  TOTAL_confusion_matrix_ridge[3,2] + 
+  TOTAL_confusion_matrix_ridge[3,3] # True Negatives
+
+TOTAL_FN_G_ridge <- TOTAL_confusion_matrix_ridge[2,1] + 
+  TOTAL_confusion_matrix_ridge[3,1] # False Negatives
+
+
+# Ria de Aveiro
+
+TOTAL_TP_Rav_ridge <- TOTAL_confusion_matrix_ridge[2,2] # True Positives
+
+TOTAL_FP_Rav_ridge <- TOTAL_confusion_matrix_ridge[2,1] + 
+  TOTAL_confusion_matrix_ridge[2,3] # False Positives
+
+TOTAL_TN_Rav_ridge <- TOTAL_confusion_matrix_ridge[1,1] + 
+  TOTAL_confusion_matrix_ridge[1,3] + 
+  TOTAL_confusion_matrix_ridge[3,1] + 
+  TOTAL_confusion_matrix_ridge[3,3] # True Negatives
+
+TOTAL_FN_Rav_ridge <- TOTAL_confusion_matrix_ridge[1,2] + 
+  TOTAL_confusion_matrix_ridge[3,2] # False Negatives
+
+
+# Tagus Estuary
+
+TOTAL_TP_T_ridge <- TOTAL_confusion_matrix_ridge[3,3] # True Positives
+
+TOTAL_FP_T_ridge <- TOTAL_confusion_matrix_ridge[3,1] + 
+  TOTAL_confusion_matrix_ridge[3,2] # False Positives
+
+TOTAL_TN_T_ridge <- TOTAL_confusion_matrix_ridge[1,1] + 
+  TOTAL_confusion_matrix_ridge[1,2] +
+  TOTAL_confusion_matrix_ridge[2,1] + 
+  TOTAL_confusion_matrix_ridge[2,2] # True Negatives
+
+TOTAL_FN_T_ridge <- TOTAL_confusion_matrix_ridge[1,3] + 
+  TOTAL_confusion_matrix_ridge[2,3] # False Negatives
+
+```
+
+After calculating the confusion matrix indicators we can compute a few performance measures: accuracy, misclassification rate, precision, recall, specificity and F1-score.
+
+```{r}
+
+# Accuracy
+TOTAL_accuracy_G_ridge <- (TOTAL_TP_G_ridge + 
+                             TOTAL_TN_G_ridge)/(TOTAL_TP_G_ridge + 
+                                                  TOTAL_TN_G_ridge + 
+                                                  TOTAL_FP_G_ridge +
+                                                  TOTAL_FN_G_ridge) 
+TOTAL_accuracy_Rav_ridge <- (TOTAL_TP_Rav_ridge + 
+                               TOTAL_TN_Rav_ridge)/(TOTAL_TP_Rav_ridge +
+                                                      TOTAL_TN_Rav_ridge +
+                                                      TOTAL_FP_Rav_ridge +
+                                                      TOTAL_FN_Rav_ridge)
+TOTAL_accuracy_T_ridge <- (TOTAL_TP_T_ridge +
+                             TOTAL_TN_T_ridge)/(TOTAL_TP_T_ridge +
+                                                  TOTAL_TN_T_ridge +
+                                                  TOTAL_FP_T_ridge +
+                                                  TOTAL_FN_T_ridge)
+
+# Missclassification Rate 
+TOTAL_missclassification_G_ridge <- 1 - TOTAL_accuracy_G_ridge
+TOTAL_missclassification_Rav_ridge <- 1 - TOTAL_accuracy_Rav_ridge
+TOTAL_missclassification_T_ridge <- 1 - TOTAL_accuracy_T_ridge
+
+# Precision 
+TOTAL_precision_G_ridge <- TOTAL_TP_G_ridge/(TOTAL_TP_G_ridge +
+                                               TOTAL_FP_G_ridge)
+TOTAL_precision_Rav_ridge <- TOTAL_TP_Rav_ridge/(TOTAL_TP_Rav_ridge +
+                                                   TOTAL_FP_Rav_ridge)
+TOTAL_precision_T_ridge <- TOTAL_TP_T_ridge/(TOTAL_TP_T_ridge +
+                                               TOTAL_FP_T_ridge)
+
+# Recall
+TOTAL_recall_G_ridge <- TOTAL_TP_G_ridge/(TOTAL_TP_G_ridge +
+                                            TOTAL_FN_G_ridge)
+TOTAL_recall_Rav_ridge <- TOTAL_TP_Rav_ridge/(TOTAL_TP_Rav_ridge +
+                                                TOTAL_FN_Rav_ridge)
+TOTAL_recall_T_ridge <- TOTAL_TP_T_ridge/(TOTAL_TP_T_ridge +
+                                            TOTAL_FN_T_ridge)
+
+# Specificity
+TOTAL_specificity_G_ridge <- TOTAL_TN_G_ridge/(TOTAL_TN_G_ridge +
+                                                 TOTAL_FP_G_ridge)
+TOTAL_specificity_Rav_ridge <- TOTAL_TN_Rav_ridge/(TOTAL_TN_Rav_ridge +
+                                                     TOTAL_FP_Rav_ridge)
+TOTAL_specificity_T_ridge <- TOTAL_TN_T_ridge/(TOTAL_TN_T_ridge +
+                                                 TOTAL_FP_T_ridge)
+
+# F1-score 
+TOTAL_F1_G_ridge <- 2*TOTAL_TP_G_ridge/(2*TOTAL_TP_G_ridge +
+                                          TOTAL_FP_G_ridge +
+                                          TOTAL_FN_G_ridge)
+TOTAL_F1_Rav_ridge <- 2*TOTAL_TP_Rav_ridge/(2*TOTAL_TP_Rav_ridge +
+                                              TOTAL_FP_Rav_ridge +
+                                              TOTAL_FN_Rav_ridge)
+TOTAL_F1_T_ridge <- 2*TOTAL_TP_T_ridge/(2*TOTAL_TP_T_ridge +
+                                          TOTAL_FP_T_ridge +
+                                          TOTAL_FN_T_ridge)
+```
+
+The measures above are calculated on each class of the response variable, but we can also calculate some overall model measures: micro F1, macro F1 and weighted F1.
+
+```{r}
+
+# To help with the computation of the overall model measures... 
+TOTAL_TP_ridge <- TOTAL_TP_G_ridge + TOTAL_TP_Rav_ridge + TOTAL_TP_T_ridge # Total True Positives
+TOTAL_FP_ridge <- TOTAL_FP_G_ridge + TOTAL_FP_Rav_ridge + TOTAL_FP_T_ridge # Total False Positives
+TOTAL_TN_ridge <- TOTAL_TN_G_ridge + TOTAL_TN_Rav_ridge + TOTAL_TN_T_ridge # Total True Negatives
+TOTAL_FN_ridge <- TOTAL_FN_G_ridge + TOTAL_FN_Rav_ridge + TOTAL_FN_T_ridge # Total False Negatives
+
+TOTAL_precision_ridge <- TOTAL_TP_ridge/(TOTAL_TP_ridge + TOTAL_FP_ridge) # Total Precision Ridge
+TOTAL_recall_ridge <- TOTAL_TP_ridge/(TOTAL_TP_ridge + TOTAL_FN_ridge) # Total Recall Ridge
+
+TOTAL_G_ridge <- colSums(TOTAL_confusion_matrix_ridge)[1] # frequency of "Ría de Vigo" class on the testing sets
+TOTAL_Rav_ridge <- colSums(TOTAL_confusion_matrix_ridge)[2] # frequency of "Ria de Aveiro" class on the testing sets
+TOTAL_T_ridge <- colSums(TOTAL_confusion_matrix_ridge)[3] # frequency of "Tagus Estuary" class on the testing sets
+
+# Micro F1 
+TOTAL_micro_F1_ridge <- 2*TOTAL_precision_ridge*TOTAL_recall_ridge/(TOTAL_precision_ridge+TOTAL_recall_ridge)
+
+# Macro F1 
+TOTAL_Macro_F1_ridge <- (TOTAL_F1_G_ridge + TOTAL_F1_Rav_ridge + TOTAL_F1_T_ridge)/3
+
+# Weighted F1
+
+TOTAL_weight_F1_ridge <- (TOTAL_G_ridge * TOTAL_F1_G_ridge + 
+                            TOTAL_Rav_ridge * TOTAL_F1_Rav_ridge +
+                            TOTAL_T_ridge * TOTAL_F1_T_ridge)/(TOTAL_G_ridge + TOTAL_Rav_ridge + TOTAL_T_ridge)
+
+```
+
+
+### LASSO
+
+Each LASSO model predicted the classes of their respective 6 test observations. For the confusion matrix analysis we merged the 1000 testing sets and the predicted classes made by the 1000 LASSO models.
+
+
+```{r}
+
+df_pred_class_lasso_total <- ldply(fit.lasso.pred.class,data.frame) # merged predicted classes made by the 1000 LASSO models
+
+
+```
+
+Bellow see LASSO's confusion matrix.
+
+```{r}
+
+TOTAL_confusion_matrix_lasso <- confusionMatrix(as.factor(df_pred_class_lasso_total$s0), as.factor(df_y_test_total$X..i..))$table
+TOTAL_confusion_matrix_lasso # LASSO confusion matrix
+
+```
+
+Confusion matrices allow us to compute a few indicators: true positives, false positives, true negatives and false negatives.
+
+```{r}
+
+# Ría de Vigo
+
+TOTAL_TP_G_lasso <- TOTAL_confusion_matrix_lasso[1,1]  # True Positives
+
+TOTAL_FP_G_lasso <- TOTAL_confusion_matrix_lasso[1,2] + 
+  TOTAL_confusion_matrix_lasso[1,3] # False Positives
+
+TOTAL_TN_G_lasso <- TOTAL_confusion_matrix_lasso[2,2] + 
+  TOTAL_confusion_matrix_lasso[2,3] +
+  TOTAL_confusion_matrix_lasso[3,2] + 
+  TOTAL_confusion_matrix_lasso[3,3] # True Negatives
+
+TOTAL_FN_G_lasso <- TOTAL_confusion_matrix_lasso[2,1] + 
+  TOTAL_confusion_matrix_lasso[3,1] # False Negatives
+
+
+# Ría de Aveiro
+
+TOTAL_TP_Rav_lasso <- TOTAL_confusion_matrix_lasso[2,2] # True Positives
+
+TOTAL_FP_Rav_lasso <- TOTAL_confusion_matrix_lasso[2,1] + 
+  TOTAL_confusion_matrix_lasso[2,3] # False Positives
+
+TOTAL_TN_Rav_lasso <- TOTAL_confusion_matrix_lasso[1,1] + 
+  TOTAL_confusion_matrix_lasso[1,3] + 
+  TOTAL_confusion_matrix_lasso[3,1] + 
+  TOTAL_confusion_matrix_lasso[3,3] # True Negatives
+
+TOTAL_FN_Rav_lasso <- TOTAL_confusion_matrix_lasso[1,2] + 
+  TOTAL_confusion_matrix_lasso[3,2] # False Negatives 
+
+
+# Tagus Estuary
+
+TOTAL_TP_T_lasso <- TOTAL_confusion_matrix_lasso[3,3] # True Positives
+
+TOTAL_FP_T_lasso <- TOTAL_confusion_matrix_lasso[3,1] + 
+  TOTAL_confusion_matrix_lasso[3,2] # False Positives
+
+TOTAL_TN_T_lasso <- TOTAL_confusion_matrix_lasso[1,1] + 
+  TOTAL_confusion_matrix_lasso[1,2] +
+  TOTAL_confusion_matrix_lasso[2,1] + 
+  TOTAL_confusion_matrix_lasso[2,2] # True Negatives
+
+TOTAL_FN_T_lasso <- TOTAL_confusion_matrix_lasso[1,3] + 
+  TOTAL_confusion_matrix_lasso[2,3] # False Negatives
+
+```
+
+After calculating the confusion matrix indicators we can compute a few performance measures: accuracy, misclassification rate, precision, recall, specificity and F1-score.
+
+```{r}
+
+# Accuracy
+TOTAL_accuracy_G_lasso <- (TOTAL_TP_G_lasso + 
+                             TOTAL_TN_G_lasso)/(TOTAL_TP_G_lasso + 
+                                                  TOTAL_TN_G_lasso + 
+                                                  TOTAL_FP_G_lasso +
+                                                  TOTAL_FN_G_lasso)
+TOTAL_accuracy_Rav_lasso <- (TOTAL_TP_Rav_lasso + 
+                               TOTAL_TN_Rav_lasso)/(TOTAL_TP_Rav_lasso +
+                                                      TOTAL_TN_Rav_lasso +
+                                                      TOTAL_FP_Rav_lasso +
+                                                      TOTAL_FN_Rav_lasso)
+TOTAL_accuracy_T_lasso <- (TOTAL_TP_T_lasso +
+                             TOTAL_TN_T_lasso)/(TOTAL_TP_T_lasso +
+                                                  TOTAL_TN_T_lasso +
+                                                  TOTAL_FP_T_lasso +
+                                                  TOTAL_FN_T_lasso)
+
+# Missclassification Rate
+TOTAL_missclassification_G_lasso <- 1 - TOTAL_accuracy_G_lasso
+TOTAL_missclassification_Rav_lasso <- 1 - TOTAL_accuracy_Rav_lasso
+TOTAL_missclassification_T_lasso <- 1 - TOTAL_accuracy_T_lasso
+
+# Precision
+TOTAL_precision_G_lasso <- TOTAL_TP_G_lasso/(TOTAL_TP_G_lasso +
+                                               TOTAL_FP_G_lasso)
+TOTAL_precision_Rav_lasso <- TOTAL_TP_Rav_lasso/(TOTAL_TP_Rav_lasso +
+                                                   TOTAL_FP_Rav_lasso)
+TOTAL_precision_T_lasso <- TOTAL_TP_T_lasso/(TOTAL_TP_T_lasso +
+                                               TOTAL_FP_T_lasso)
+
+# Recall
+TOTAL_recall_G_lasso <- TOTAL_TP_G_lasso/(TOTAL_TP_G_lasso +
+                                            TOTAL_FN_G_lasso)
+TOTAL_recall_Rav_lasso <- TOTAL_TP_Rav_lasso/(TOTAL_TP_Rav_lasso +
+                                                TOTAL_FN_Rav_lasso)
+TOTAL_recall_T_lasso <- TOTAL_TP_T_lasso/(TOTAL_TP_T_lasso +
+                                            TOTAL_FN_T_lasso)
+
+# Specificity
+TOTAL_specificity_G_lasso <- TOTAL_TN_G_lasso/(TOTAL_TN_G_lasso +
+                                                 TOTAL_FP_G_lasso)
+TOTAL_specificity_Rav_lasso <- TOTAL_TN_Rav_lasso/(TOTAL_TN_Rav_lasso +
+                                                     TOTAL_FP_Rav_lasso)
+TOTAL_specificity_T_lasso <- TOTAL_TN_T_lasso/(TOTAL_TN_T_lasso +
+                                                 TOTAL_FP_T_lasso)
+
+# F1-score
+TOTAL_F1_G_lasso <- 2*TOTAL_TP_G_lasso/(2*TOTAL_TP_G_lasso +
+                                          TOTAL_FP_G_lasso +
+                                          TOTAL_FN_G_lasso)
+TOTAL_F1_Rav_lasso <- 2*TOTAL_TP_Rav_lasso/(2*TOTAL_TP_Rav_lasso +
+                                              TOTAL_FP_Rav_lasso +
+                                              TOTAL_FN_Rav_lasso)
+TOTAL_F1_T_lasso <- 2*TOTAL_TP_T_lasso/(2*TOTAL_TP_T_lasso +
+                                          TOTAL_FP_T_lasso +
+                                          TOTAL_FN_T_lasso)
+
+```
+
+The measures above are calculated on each class of the response variable, but we can also calculate some overall model measures: micro F1, macro F1 and weighted F1.
+
+```{r}
+
+# To help with the computation of the overall model measures... 
+TOTAL_TP_lasso <- TOTAL_TP_G_lasso + TOTAL_TP_Rav_lasso + TOTAL_TP_T_lasso # Total True Positives
+TOTAL_FP_lasso <- TOTAL_FP_G_lasso + TOTAL_FP_Rav_lasso + TOTAL_FP_T_lasso # Total False Positives
+TOTAL_TN_lasso <- TOTAL_TN_G_lasso + TOTAL_TN_Rav_lasso + TOTAL_TN_T_lasso # Total True Negatives
+TOTAL_FN_lasso <- TOTAL_FN_G_lasso + TOTAL_FN_Rav_lasso + TOTAL_FN_T_lasso # Total False Positives
+
+TOTAL_precision_lasso <- TOTAL_TP_lasso/(TOTAL_TP_lasso + TOTAL_FP_lasso) # Total Precision LASSO
+TOTAL_recall_lasso <- TOTAL_TP_lasso/(TOTAL_TP_lasso + TOTAL_FN_lasso) # Total Recall LASSO
+
+TOTAL_G_lasso <- colSums(TOTAL_confusion_matrix_lasso)[1] # frequency of "Ría de Vigo" class on the testing sets
+TOTAL_Rav_lasso <- colSums(TOTAL_confusion_matrix_lasso)[2] # frequency of "Ria de Aveiro" class on the testing sets
+TOTAL_T_lasso <- colSums(TOTAL_confusion_matrix_lasso)[3] # frequency of "Tagus Estuary" class on the testing sets
+
+
+# Micro F1
+TOTAL_micro_F1_lasso <- 2*TOTAL_precision_lasso*TOTAL_recall_lasso/(TOTAL_precision_lasso+TOTAL_recall_lasso)
+
+# Macro F1
+TOTAL_Macro_F1_lasso <- (TOTAL_F1_G_lasso + TOTAL_F1_Rav_lasso + TOTAL_F1_T_lasso)/3
+
+# Weighted F1
+TOTAL_weight_F1_lasso <- (TOTAL_G_lasso * TOTAL_F1_G_lasso + 
+                            TOTAL_Rav_lasso * TOTAL_F1_Rav_lasso +
+                            TOTAL_T_lasso * TOTAL_F1_T_lasso)/(TOTAL_G_lasso + TOTAL_Rav_lasso + TOTAL_T_lasso)
+
+```
+
+
+### Elastic Net
+
+Each Elastic Net model predicted the classes of their respective 6 test observations. For the confusion matrix analysis we merged the 1000 testing sets and the predicted classes made by the 1000 Elastic Net models.
+
+
+```{r}
+
+df_pred_class_en_total <- ldply(fit.en.pred.class,data.frame) # merged predicted classes made by the 1000 Elastic Net models
+
+```
+
+Bellow see Elastic Net's confusion matrix.
+
+```{r}
+
+
+TOTAL_confusion_matrix_en <- confusionMatrix(as.factor(df_pred_class_en_total$s0), as.factor(df_y_test_total$X..i..))$table
+TOTAL_confusion_matrix_en # Elastic Net confusion matrix
+
+```
+
+Confusion matrices allow us to compute a few indicators: true positives, false positives, true negatives and false negatives
+
+
+```{r}
+
+# Ría de Vigo
+
+TOTAL_TP_G_en <- TOTAL_confusion_matrix_en[1,1] # True Positives
+
+TOTAL_FP_G_en <- TOTAL_confusion_matrix_en[1,2] + 
+  TOTAL_confusion_matrix_en[1,3] # False Positives
+
+TOTAL_TN_G_en <- TOTAL_confusion_matrix_en[2,2] + 
+  TOTAL_confusion_matrix_en[2,3] +
+  TOTAL_confusion_matrix_en[3,2] + 
+  TOTAL_confusion_matrix_en[3,3] # True Negatives
+
+TOTAL_FN_G_en <- TOTAL_confusion_matrix_en[2,1] + 
+  TOTAL_confusion_matrix_en[3,1] # False Negatives
+
+
+# Ria de Aveiro
+
+TOTAL_TP_Rav_en <- TOTAL_confusion_matrix_en[2,2] # True Positives
+
+TOTAL_FP_Rav_en <- TOTAL_confusion_matrix_en[2,1] + 
+  TOTAL_confusion_matrix_en[2,3] # False Positives
+
+TOTAL_TN_Rav_en <- TOTAL_confusion_matrix_en[1,1] + 
+  TOTAL_confusion_matrix_en[1,3] + 
+  TOTAL_confusion_matrix_en[3,1] + 
+  TOTAL_confusion_matrix_en[3,3] # True Negatives
+
+TOTAL_FN_Rav_en <- TOTAL_confusion_matrix_en[1,2] + 
+  TOTAL_confusion_matrix_en[3,2] # False Negatives
+
+
+# Tagus Estuary
+
+TOTAL_TP_T_en <- TOTAL_confusion_matrix_en[3,3] # True Positives
+
+TOTAL_FP_T_en <- TOTAL_confusion_matrix_en[3,1] + 
+  TOTAL_confusion_matrix_en[3,2] # False Positives
+
+TOTAL_TN_T_en <- TOTAL_confusion_matrix_en[1,1] + 
+  TOTAL_confusion_matrix_en[1,2] +
+  TOTAL_confusion_matrix_en[2,1] + 
+  TOTAL_confusion_matrix_en[2,2] # True Negatives
+
+TOTAL_FN_T_en <- TOTAL_confusion_matrix_en[1,3] + 
+  TOTAL_confusion_matrix_en[2,3] # False Negatives
+
+```
+
+After calculating the confusion matrix indicators we can compute a few performance measures: accuracy, misclassification rate, precision, recall, specificity and F1-score.
+
+
+```{r}
+
+# Accuracy
+TOTAL_accuracy_G_en <- (TOTAL_TP_G_en + 
+                          TOTAL_TN_G_en)/(TOTAL_TP_G_en + 
+                                            TOTAL_TN_G_en + 
+                                            TOTAL_FP_G_en +
+                                            TOTAL_FN_G_en)
+TOTAL_accuracy_Rav_en <- (TOTAL_TP_Rav_en + 
+                            TOTAL_TN_Rav_en)/(TOTAL_TP_Rav_en +
+                                                TOTAL_TN_Rav_en +
+                                                TOTAL_FP_Rav_en +
+                                                TOTAL_FN_Rav_en)
+TOTAL_accuracy_T_en <- (TOTAL_TP_T_en +
+                          TOTAL_TN_T_en)/(TOTAL_TP_T_en +
+                                            TOTAL_TN_T_en +
+                                            TOTAL_FP_T_en +
+                                            TOTAL_FN_T_en)
+
+# Missclassification Rate
+TOTAL_missclassification_G_en <- 1 - TOTAL_accuracy_G_en
+TOTAL_missclassification_Rav_en <- 1 - TOTAL_accuracy_Rav_en
+TOTAL_missclassification_T_en <- 1 - TOTAL_accuracy_T_en
+
+# Precision
+TOTAL_precision_G_en <- TOTAL_TP_G_en/(TOTAL_TP_G_en +
+                                         TOTAL_FP_G_en)
+TOTAL_precision_Rav_en <- TOTAL_TP_Rav_en/(TOTAL_TP_Rav_en +
+                                             TOTAL_FP_Rav_en)
+TOTAL_precision_T_en <- TOTAL_TP_T_en/(TOTAL_TP_T_en +
+                                         TOTAL_FP_T_en)
+
+# Recall
+TOTAL_recall_G_en <- TOTAL_TP_G_en/(TOTAL_TP_G_en +
+                                      TOTAL_FN_G_en)
+TOTAL_recall_Rav_en <- TOTAL_TP_Rav_en/(TOTAL_TP_Rav_en +
+                                          TOTAL_FN_Rav_en)
+TOTAL_recall_T_en <- TOTAL_TP_T_en/(TOTAL_TP_T_en +
+                                      TOTAL_FN_T_en)
+
+# Specificity
+TOTAL_specificity_G_en <- TOTAL_TN_G_en/(TOTAL_TN_G_en +
+                                           TOTAL_FP_G_en)
+TOTAL_specificity_Rav_en <- TOTAL_TN_Rav_en/(TOTAL_TN_Rav_en +
+                                               TOTAL_FP_Rav_en)
+TOTAL_specificity_T_en <- TOTAL_TN_T_en/(TOTAL_TN_T_en +
+                                           TOTAL_FP_T_en)
+
+# F1-score
+TOTAL_F1_G_en <- 2*TOTAL_TP_G_en/(2*TOTAL_TP_G_en +
+                                    TOTAL_FP_G_en +
+                                    TOTAL_FN_G_en)
+TOTAL_F1_Rav_en <- 2*TOTAL_TP_Rav_en/(2*TOTAL_TP_Rav_en +
+                                        TOTAL_FP_Rav_en +
+                                        TOTAL_FN_Rav_en)
+TOTAL_F1_T_en <- 2*TOTAL_TP_T_en/(2*TOTAL_TP_T_en +
+                                    TOTAL_FP_T_en +
+                                    TOTAL_FN_T_en)
+
+```
+
+The measures above are calculated on each class of the response variable, but we can also calculate some overall model measures: micro F1, macro F1 and weighted F1.
+
+
+```{r}
+
+# To help with the computation of the overall model measures... 
+TOTAL_TP_en <- TOTAL_TP_G_en + TOTAL_TP_Rav_en + TOTAL_TP_T_en # Total True Positives
+TOTAL_FP_en <- TOTAL_FP_G_en + TOTAL_FP_Rav_en + TOTAL_FP_T_en # Total False Positives
+TOTAL_TN_en <- TOTAL_TN_G_en + TOTAL_TN_Rav_en + TOTAL_TN_T_en # Total True Negatives
+TOTAL_FN_en <- TOTAL_FN_G_en + TOTAL_FN_Rav_en + TOTAL_FN_T_en # Total False Negatives
+
+TOTAL_precision_en <- TOTAL_TP_en/(TOTAL_TP_en + TOTAL_FP_en) # Total Precision Elastic Net
+TOTAL_recall_en <- TOTAL_TP_en/(TOTAL_TP_en + TOTAL_FN_en) # Total Recall Elastic Net
+
+TOTAL_G_en <- colSums(TOTAL_confusion_matrix_en)[1] # frequency of "Ría de Vigo" class on the testing sets
+TOTAL_Rav_en <- colSums(TOTAL_confusion_matrix_en)[2] # frequency of "Ria de Aveiro" class on the testing sets
+TOTAL_T_en <- colSums(TOTAL_confusion_matrix_en)[3] # frequency of "Tagus Estuary" class on the testing sets
+
+# Micro F1
+TOTAL_micro_F1_en <- 2*TOTAL_precision_en*TOTAL_recall_en/(TOTAL_precision_en+TOTAL_recall_en)
+
+# Macro F1 
+TOTAL_Macro_F1_en <- (TOTAL_F1_G_en + TOTAL_F1_Rav_en + TOTAL_F1_T_en)/3
+
+# Weighted F1
+TOTAL_weight_F1_en <- (TOTAL_G_en * TOTAL_F1_G_en + 
+                         TOTAL_Rav_en * TOTAL_F1_Rav_en +
+                         TOTAL_T_en * TOTAL_F1_T_en)/(TOTAL_G_en + TOTAL_Rav_en + TOTAL_T_en)
+
+```
+
+
+## ROC curves
+
+A ROC curve reflects the relationship between True Positive Rate and False Positive Rate by varying the discrimination threshold
+values.
+
+### Ridge
+
+In order to compute the Ridge ROC curves, we relied on the following measures.
+
+```{r}
+
+predictions_ridge_G <- list() # Ridge models' predicted probabilities of test observations belonging to the "Ría de Vigo" class
+predictions_ridge_Rav <- list() # Ridge models'  probabilities of test observations belonging to the "Ria de Aveiro" class
+predictions_ridge_T <- list() # Ridge models' predicted probabilities of test observations belonging to the "Tagus Estuary" class
+
+for (i in 1:M) {
+  predictions_ridge_G[[i]] <- as.data.frame(fit.ridge.pred[[i]])[,1]
+  predictions_ridge_Rav[[i]] <- as.data.frame(fit.ridge.pred[[i]])[,2]
+  predictions_ridge_T[[i]] <- as.data.frame(fit.ridge.pred[[i]])[,3]
+}
+
+```
+
+For this analysis we relied to merging the testing sets and the predicted probabilities relative to each Ridge model.
+
+```{r}
+
+TOTAL_predictions_ridge_G <- ldply(predictions_ridge_G,data.frame)
+TOTAL_predictions_ridge_G <- TOTAL_predictions_ridge_G$X..i.. # merged predicted probabilities for the "Ría de Vigo" class throughout the 1000 Ridge models
+
+TOTAL_predictions_ridge_Rav <- ldply(predictions_ridge_Rav,data.frame)
+TOTAL_predictions_ridge_Rav <- TOTAL_predictions_ridge_Rav$X..i.. # merged predicted probabilities for the "Ria de Aveiro" class throughout the 1000 Ridge models
+
+TOTAL_predictions_ridge_T <- ldply(predictions_ridge_T,data.frame)
+TOTAL_predictions_ridge_T <- TOTAL_predictions_ridge_T$X..i.. # merged predicted probabilities for the "Tagus Estuary" class throughout the 1000 Ridge models
+
+```
+
+Because ROC curves are used to analyze the predictive quality of binary problems, we opted to construct a ROC curve per class of the response variable.
+
+```{r}
+
+TOTAL_labels_ridge_G <- as.numeric(factor(df_y_test_total$X..i..,levels=c("G","Other"))) # indicator of whether or not the observations in the merged testing set belonged to the "Ría de Vigo" class
+TOTAL_labels_ridge_G[is.na(TOTAL_labels_ridge_G)] <- 0
+
+TOTAL_labels_ridge_Rav <- as.numeric(factor(df_y_test_total$X..i..,levels=c("Rav","Other")))
+TOTAL_labels_ridge_Rav[is.na(TOTAL_labels_ridge_Rav)] <- 0 # indicator of whether or not the observations in the merged testing set belonged to the "Ria de Aveiro" class
+
+TOTAL_labels_ridge_T <- as.numeric(factor(df_y_test_total$X..i..,levels=c("T","Other")))
+TOTAL_labels_ridge_T[is.na(TOTAL_labels_ridge_T)] <- 0 # indicator of whether or not the observations in the merged testing set belonged to the "Tagus Estuary" class
+
+```
+
+To perfom a ROC curve analysis, we resorted to the "prediction" and "performance" functions to transform the input data into a standardized format.
+
+```{r}
+
+TOTAL_pred_ridge_G <- prediction(TOTAL_predictions_ridge_G,TOTAL_labels_ridge_G) # prediction object for "Ría de Vigo"
+TOTAL_perf_ridge_G <- performance(TOTAL_pred_ridge_G,"tpr","fpr") # performance object for "Ría de Vigo"
+
+TOTAL_pred_ridge_Rav <- prediction(TOTAL_predictions_ridge_Rav,TOTAL_labels_ridge_Rav) # prediction object for "Ria de Aveiro"
+TOTAL_perf_ridge_Rav <- performance(TOTAL_pred_ridge_Rav,"tpr","fpr")# performance object for "Ria de Aveiro"
+
+TOTAL_pred_ridge_T <- prediction(TOTAL_predictions_ridge_T,TOTAL_labels_ridge_T) # prediction object for "Tagus Estuary"
+TOTAL_perf_ridge_T <- performance(TOTAL_pred_ridge_T,"tpr","fpr") # performance object for "Tagus Estuary"
+
+```
+
+See below the Ridge ROC curves used to analyze the prediction of the different classes of the response variable.
+
+```{r}
+
+TOTAL_PRROC_obj_ridge_G <- roc.curve(scores.class0 = TOTAL_predictions_ridge_G, weights.class0 = TOTAL_labels_ridge_G, curve=TRUE) # object containing information that allows us to construct ROC curve linked to Ridge's prediction of the "Ría de Vigo" class
+
+TOTAL_PRROC_obj_ridge_Rav <- roc.curve(scores.class0 = TOTAL_predictions_ridge_Rav, weights.class0 = TOTAL_labels_ridge_Rav, curve=TRUE) # object containing information that allows us to construct ROC curve linked to Ridge's prediction of the "Ria de Aveiro" class
+
+TOTAL_PRROC_obj_ridge_T <- roc.curve(scores.class0 = TOTAL_predictions_ridge_T, weights.class0 = TOTAL_labels_ridge_T, curve=TRUE) # object containing information that allows us to construct ROC curve linked to Ridge's prediction of the "Tagus Estuary" class
+
+
+# ROC curves
+plot(TOTAL_perf_ridge_G,  lwd=2, lty=1)
+plot(TOTAL_perf_ridge_Rav,lwd=2, lty=2, add = T)
+plot(TOTAL_perf_ridge_T, lwd=2, lty=3, add = T)
+legend(0.6,0.7,c("Ría de Vigo, RV","Ria de Aveiro, RAv",
+                 "Tagus Estuary, TE"), cex=1, lty=1:3, bty = "n")
+
+```
+
+Analyzing these curves' AUC score (area under the curve) is also usefull.
+
+```{r}
+
+TOTAL_PRROC_obj_ridge_G$auc # AUC of Ridge's "Ría de Vigo" ROC curve
+TOTAL_PRROC_obj_ridge_Rav$auc # AUC of Ridge's "Ria de Aveiro" ROC curve
+TOTAL_PRROC_obj_ridge_T$auc # AUC of Ridge's "Tagus Estuary" ROC curve
+
+```
+
+
+### LASSO
+
+In order to compute the LASSO ROC curves, we relied on the following measures.
+
+```{r}
+
+predictions_lasso_G <- list() # LASSO models' predicted probabilities of test observations belonging to the "Ría de Vigo" class
+predictions_lasso_Rav <- list() # LASSO models' predicted probabilities of test observations belonging to the "Ria de Aveiro" class
+predictions_lasso_T <- list() # LASSO models' predicted probabilities of test observations belonging to the "Tagus Estuary" class
+
+for (i in 1:M) {
+  predictions_lasso_G[[i]] <- as.data.frame(fit.lasso.pred[[i]])[,1]
+  predictions_lasso_Rav[[i]] <- as.data.frame(fit.lasso.pred[[i]])[,2]
+  predictions_lasso_T[[i]] <- as.data.frame(fit.lasso.pred[[i]])[,3]
+}
+
+```
+
+For this analysis we relied to merging the testing sets and the predicted probabilities relative to each LASSO model.
+
+```{r}
+
+TOTAL_predictions_lasso_G <- ldply(predictions_lasso_G,data.frame)
+TOTAL_predictions_lasso_G <- TOTAL_predictions_lasso_G$X..i.. # merged predicted probabilities for the "Ría de Vigo" class throughout the 1000 LASSO models
+
+TOTAL_predictions_lasso_Rav <- ldply(predictions_lasso_Rav,data.frame)
+TOTAL_predictions_lasso_Rav <- TOTAL_predictions_lasso_Rav$X..i.. # merged predicted probabilities for the "Ria de Aveiro" class throughout the 1000 LASSO models
+
+TOTAL_predictions_lasso_T <- ldply(predictions_lasso_T,data.frame)
+TOTAL_predictions_lasso_T <- TOTAL_predictions_lasso_T$X..i.. # merged predicted probabilities for the "Tagus Estuary" class throughout the 1000 LASSO models
+
+```
+
+Because ROC curves are used to analyze the predictive quality of binary problems, we opted to construct a ROC curve per class of the response variable.
+
+```{r}
+
+TOTAL_labels_lasso_G <- as.numeric(factor(df_y_test_total$X..i..,levels=c("G","Other"))) # indicator of whether or not the observations in the merged testing set belonged to the "Ría de Vigo" class
+TOTAL_labels_lasso_G[is.na(TOTAL_labels_lasso_G)] <- 0
+
+TOTAL_labels_lasso_Rav <- as.numeric(factor(df_y_test_total$X..i..,levels=c("Rav","Other"))) # indicator of whether or not the observations in the merged testing set belonged to the "Ria de Aveiro" class
+TOTAL_labels_lasso_Rav[is.na(TOTAL_labels_lasso_Rav)] <- 0
+
+TOTAL_labels_lasso_T <- as.numeric(factor(df_y_test_total$X..i..,levels=c("T","Other")))
+TOTAL_labels_lasso_T[is.na(TOTAL_labels_lasso_T)] <- 0 # indicator of whether or not the observations in the merged testing set belonged to the "Tagus Estuary" class
+
+```
+
+To perfom a ROC curve analysis, we resorted to the "prediction" and "performance" functions to transform the input data into a standardized format.
+
+```{r}
+
+TOTAL_pred_lasso_G <- prediction(TOTAL_predictions_lasso_G,TOTAL_labels_lasso_G) # prediction object for "Ría de Vigo"
+TOTAL_perf_lasso_G <- performance(TOTAL_pred_lasso_G,"tpr","fpr") # performance object for "Ría de Vigo"
+
+TOTAL_pred_lasso_Rav <- prediction(TOTAL_predictions_lasso_Rav,TOTAL_labels_lasso_Rav) # prediction object for "Ria de Aveiro"
+TOTAL_perf_lasso_Rav <- performance(TOTAL_pred_lasso_Rav,"tpr","fpr")# performance object for "Ria de Aveiro"
+
+TOTAL_pred_lasso_T <- prediction(TOTAL_predictions_lasso_T,TOTAL_labels_lasso_T) # prediction object for "Tagus Estuary"
+TOTAL_perf_lasso_T <- performance(TOTAL_pred_lasso_T,"tpr","fpr") # performance object for "Tagus Estuary"
+
+```
+
+See below the LASSO ROC curves used to analyze the prediction of the different classes of the response variable.
+
+```{r}
+
+TOTAL_PRROC_obj_lasso_G <- roc.curve(scores.class0 = TOTAL_predictions_lasso_G, weights.class0 = TOTAL_labels_lasso_G, curve=TRUE) # object containing information that allows us to construct ROC curve linked to LASSO's prediction of the "Ría de Vigo" class
+
+TOTAL_PRROC_obj_lasso_Rav <- roc.curve(scores.class0 = TOTAL_predictions_lasso_Rav, weights.class0 = TOTAL_labels_lasso_Rav, curve=TRUE) # object containing information that allows us to construct ROC curve linked to LASSO's prediction of the "Ria de Aveiro" class
+
+TOTAL_PRROC_obj_lasso_T <- roc.curve(scores.class0 = TOTAL_predictions_lasso_T, weights.class0 = TOTAL_labels_lasso_T, curve=TRUE) # object containing information that allows us to construct ROC curve linked to LASSO's prediction of the "Tagus Estuary" class
+
+
+# ROC curves
+plot(TOTAL_perf_lasso_G,  lwd=2, lty=1)
+plot(TOTAL_perf_lasso_Rav,lwd=2, lty=2, add = T)
+plot(TOTAL_perf_lasso_T, lwd=2, lty=3, add = T)
+legend(0.6,0.7,c("Ría de Vigo, RV","Ria de Aveiro, RAv",
+                 "Tagus Estuary, TE"), cex=1, lty=1:3, bty = "n")
+
+```
+
+Analyzing these curves' AUC score (area under the curve) is also usefull.
+
+```{r}
+
+TOTAL_PRROC_obj_lasso_G$auc # AUC of LASSO's "Ría de Vigo" ROC curve
+TOTAL_PRROC_obj_lasso_Rav$auc # AUC of LASSO's "Ria de Aveiro" ROC curve
+TOTAL_PRROC_obj_lasso_T$auc # AUC of LASSO's "Tagus Estuary" ROC curve
+
+```
+
+
+### Elastic Net
+
+In order to compute the Elastic Net ROC curves, we relied on the following measures.
+
+```{r}
+
+predictions_en_G <- list() # Elastic Net models' predicted probabilities of test observations belonging to the "Ría de Vigo" class
+predictions_en_Rav <- list() # Elastic Net models' predicted probabilities of test observations belonging to the "Ria de Aveiro" class
+predictions_en_T <- list() # Elastic Net models' predicted probabilities of test observations belonging to the "Tagus Estuary" class
+
+for (i in 1:M) {
+  predictions_en_G[[i]] <- as.data.frame(fit.en.pred[[i]])[,1]
+  predictions_en_Rav[[i]] <- as.data.frame(fit.en.pred[[i]])[,2]
+  predictions_en_T[[i]] <- as.data.frame(fit.en.pred[[i]])[,3]
+}
+
+```
+
+For this analysis we relied to merging the testing sets and the predicted probabilities relative to each Elastic Net model.
+
+```{r}
+
+TOTAL_predictions_en_G <- ldply(predictions_en_G,data.frame)
+TOTAL_predictions_en_G <- TOTAL_predictions_en_G$X..i.. # merged predicted probabilities for the "Ría de Vigo" class throughout the 1000 Elastic Net models
+
+TOTAL_predictions_en_Rav <- ldply(predictions_en_Rav,data.frame)
+TOTAL_predictions_en_Rav <- TOTAL_predictions_en_Rav$X..i.. # merged predicted probabilities for the "Ria de Aveiro" class throughout the 1000 Elastic Net models
+
+TOTAL_predictions_en_T <- ldply(predictions_en_T,data.frame)
+TOTAL_predictions_en_T <- TOTAL_predictions_en_T$X..i.. # merged predicted probabilities for the "Tagus Estuary" class throughout the 1000 Elastic Net models
+
+```
+
+Because ROC curves are used to analyze the predictive quality of binary problems, we opted to construct a ROC curve per class of the response variable.
+
+```{r}
+
+TOTAL_labels_en_G <- as.numeric(factor(df_y_test_total$X..i..,levels=c("G","Other"))) # indicator of whether or not the observations in the merged testing set belonged to the "Ría de Vigo" class
+TOTAL_labels_en_G[is.na(TOTAL_labels_en_G)] <- 0
+
+TOTAL_labels_en_Rav <- as.numeric(factor(df_y_test_total$X..i..,levels=c("Rav","Other"))) # indicator of whether or not the observations in the merged testing set belonged to the "Ria de Aveiro" class
+TOTAL_labels_en_Rav[is.na(TOTAL_labels_en_Rav)] <- 0
+
+TOTAL_labels_en_T <- as.numeric(factor(df_y_test_total$X..i..,levels=c("T","Other"))) # indicator of whether or not the observations in the merged testing set belonged to the "Tagus Estuary" class
+TOTAL_labels_en_T[is.na(TOTAL_labels_en_T)] <- 0
+
+```
+
+To perfom a ROC curve analysis, we resorted to the "prediction" and "performance" functions to transform the input data into a standardized format.
+
+```{r}
+
+TOTAL_pred_en_G <- prediction(TOTAL_predictions_en_G,TOTAL_labels_en_G) # prediction object for "Ría de Vigo"
+TOTAL_perf_en_G <- performance(TOTAL_pred_en_G,"tpr","fpr") # performance object for "Ría de Vigo"
+
+TOTAL_pred_en_Rav <- prediction(TOTAL_predictions_en_Rav,TOTAL_labels_en_Rav) # prediction object for "Ria de Aveiro"
+TOTAL_perf_en_Rav <- performance(TOTAL_pred_en_Rav,"tpr","fpr") # performance object for "Ria de Aveiro"
+
+TOTAL_pred_en_T <- prediction(TOTAL_predictions_en_T,TOTAL_labels_en_T) # prediction object for "Tagus Estuary"
+TOTAL_perf_en_T <- performance(TOTAL_pred_en_T,"tpr","fpr") # performance object for "Tagus Estuary"
+
+```
+
+See below the Elastic Net ROC curves used to analyze the prediction of the different classes of the response variable.
+
+```{r}
+
+TOTAL_PRROC_obj_en_G <- roc.curve(scores.class0 = TOTAL_predictions_en_G, weights.class0 = TOTAL_labels_en_G, curve=TRUE) # object containing information that allows us to construct ROC curve linked to LASSO's prediction of the "Ría de Vigo" class
+
+TOTAL_PRROC_obj_en_Rav <- roc.curve(scores.class0 = TOTAL_predictions_en_Rav, weights.class0 = TOTAL_labels_en_Rav, curve=TRUE) # object containing information that allows us to construct ROC curve linked to LASSO's prediction of the "Ria de Aveiro" class
+
+TOTAL_PRROC_obj_en_T <- roc.curve(scores.class0 = TOTAL_predictions_en_T, weights.class0 = TOTAL_labels_en_T, curve=TRUE) # object containing information that allows us to construct ROC curve linked to LASSO's prediction of the "Tagus Estuary" class
+```
+
+```{r}
+
+# ROC curves
+plot(TOTAL_perf_en_G,  lwd=2, lty=1)
+plot(TOTAL_perf_en_Rav,lwd=2, lty=2, add = T)
+plot(TOTAL_perf_en_T, lwd=2, lty=3, add = T)
+legend(0.6,0.7,c("Ría de Vigo, RV","Ria de Aveiro, RAv",
+                 "Tagus Estuary, TE"), cex=1, lty=1:3, bty = "n")
+
+```
+
+Analyzing these curves' AUC score (area under the curve) is also usefull.
+
+```{r}
+
+TOTAL_PRROC_obj_en_G$auc # AUC of Elastic Net's "Ría de Vigo" ROC curve
+TOTAL_PRROC_obj_en_Rav$auc # AUC of Elastic Net's "Ria de Aveiro" ROC curve
+TOTAL_PRROC_obj_en_T$auc # AUC of Elastic Net's "Tagus Estuary" ROC curve
+
+```
+
+
+# Variable Importance
+
+Due to data standardization, in order to allow studying the importance of each variable on the prediction of the clams’ location of origin, we examined the absolute value of their corresponding model coefficient.
+
+```{r}
+
+var_import_ridge_pc <- list() # Ridge variable importance per class
+var_import_ridge <- list() # Ridge total variable importance (sum of variable importance per class)
+
+var_import_lasso_pc <- list() # LASSO variable importance per class
+var_import_lasso <- list() # LASSO total variable importance (sum of variable importance per class)
+
+var_import_en_pc <- list() # Elastic Net variable importance per class
+var_import_en <- list() # Elastic Net total variable importance (sum of variable importance per class)
+
+
+# WARNING : SLOW
+
+for (i in 1:M) {
+  
+# Ridge
+var_import_ridge_pc[[i]] <- varImp(fit.ridge.best[[i]],
+                                     lambda = fit.ridge.cv[[i]]$lambda.min, scale = FALSE)
+var_import_ridge[[i]] <- as.data.frame(rowSums(var_import_ridge_pc[[i]]))
+
+# LASSO
+var_import_lasso_pc[[i]] <- varImp(fit.lasso.best[[i]],
+                                     lambda = fit.lasso.cv[[i]]$lambda.min, scale = FALSE)
+  var_import_lasso[[i]] <- as.data.frame(rowSums(var_import_lasso_pc[[i]]))
+  
+# Elastic Net
+var_import_en_pc[[i]] <- varImp(fit.en.best[[i]],
+                                  lambda = fit.en.cv[[i]]$lambda.min,
+                                  scale = FALSE)
+var_import_en[[i]] <- as.data.frame(rowSums(var_import_en_pc[[i]]))
+  
+}
+
+```
+
+After computing the variable importance measures for each variable, throughout the 1000 Ridge, LASSO and Elastic Net models, we arranged them in decreasing order of importance.
+
+```{r}
+
+names_ord_ridge <- list() # variable names arranged by order of importance for the 1000 Ridge models
+var_import_ridge_ord <- list() # variable importance measures of the variables in names_ord_ridge
+
+names_ord_lasso <- list() # variable names arranged by order of importance for the 1000 LASSO models
+var_import_lasso_ord <- list() # variable importance measures of the variables in names_ord_lasso
+
+names_ord_en <- list() # variable names arranged by order of importance for the 1000 Elastic Net models
+var_import_en_ord <- list() # variable importance measures of the variables in names_ord_en
+
+for (i in 1:M) {
+  
+# Ridge
+names_ord_ridge[[i]] <- rownames(var_import_ridge[[i]][order(var_import_ridge[[i]], decreasing = TRUE),, drop=FALSE])
+var_import_ridge_ord[[i]] <- as.data.frame(cbind(names_ord_ridge[[i]], var_import_ridge[[i]][order(var_import_ridge[[i]], decreasing = TRUE),]))
+
+# LASSO
+names_ord_lasso[[i]] <- rownames(var_import_lasso[[i]][order(var_import_lasso[[i]], decreasing = TRUE),, drop=FALSE])
+var_import_lasso_ord[[i]] <- as.data.frame(cbind(names_ord_lasso[[i]], var_import_lasso[[i]][order(var_import_lasso[[i]], decreasing = TRUE),]))
+
+# Elastic Net
+names_ord_en[[i]] <- rownames(var_import_en[[i]][order(var_import_en[[i]], decreasing = TRUE),, drop=FALSE])
+var_import_en_ord[[i]] <- as.data.frame(cbind(names_ord_en[[i]], var_import_en[[i]][order(var_import_en[[i]], decreasing = TRUE),]))
+
+}
+
+```
+
+We opted to study the 10 most important variables.
+
+```{r}
+
+more_important_variables_ridge_2 <- list() # 10 most important variables in each Ridge model
+more_important_variables_lasso_2 <- list() # 10 most important variables in each LASSO model
+more_important_variables_en_2 <- list() # 10 most important variables in each Elastic Net model
+
+for (i in 1:M) {
+  
+more_important_variables_ridge_2[[i]] <- var_import_ridge_ord[[i]][seq(1:10),]
+more_important_variables_lasso_2[[i]] <- var_import_lasso_ord[[i]][seq(1:10),]
+more_important_variables_en_2[[i]] <- var_import_en_ord[[i]][seq(1:10),]
+  
+}
+
+```
+
+To study the frequency in which the different variables were selected to the top 10 most important variables throughout the 1000 models, for each regularization method, we merged the results in more_important_variables_ridge_2, more_important_variables_lasso_2 and more_important_variables_en_2 into one dataframe each.
+
+```{r}
+
+total_M_selected_variables_ridge_2 <- data.frame()
+total_M_selected_variables_lasso_2 <- data.frame()
+total_M_selected_variables_en_2 <- data.frame()
+
+for (i in 1:M) {
+  
+  for (j in 1:nrow(more_important_variables_ridge_2[[i]])) {
+    
+    total_M_selected_variables_ridge_2 <- rbind(total_M_selected_variables_ridge_2,
+                                                more_important_variables_ridge_2[[i]][j,])
+    
+  }
+  
+  for (j in 1:nrow(more_important_variables_lasso_2[[i]])) {
+    
+    total_M_selected_variables_lasso_2 <- rbind(total_M_selected_variables_lasso_2,
+                                                more_important_variables_lasso_2[[i]][j,])
+    
+  }
+  
+  for (j in 1:nrow(more_important_variables_en_2[[i]])) {
+    
+    total_M_selected_variables_en_2 <- rbind(total_M_selected_variables_en_2,
+                                             more_important_variables_en_2[[i]][j,])
+    
+  }
+}
+
+```
+
+We were then able to study the probability of the different variables being selected to the top 10 most important variables, considering the three regularization methods applied.
+
+```{r}
+
+table_ridge_2 <- as.data.frame(table(total_M_selected_variables_ridge_2$V1))
+table_ridge_2 <- table_ridge_2[order(table_ridge_2$Freq, decreasing = T),]
+rownames(table_ridge_2) <- 1:nrow(table_ridge_2)
+table_ridge_2$prob <- round(table_ridge_2$Freq/1000,4)
+table_ridge_2 # probability of the different variables being selected to the top 10 most important variables considering the Ridge method 
+
+table_lasso_2 <- as.data.frame(table(total_M_selected_variables_lasso_2$V1))
+table_lasso_2 <- table_lasso_2[order(table_lasso_2$Freq, decreasing = T),]
+rownames(table_lasso_2) <- 1:nrow(table_lasso_2)
+table_lasso_2$prob <- table_lasso_2$Freq/1000
+table_lasso_2 # probability of the different variables being selected to the top 10 most important variables considering the LASSO method 
+
+table_en_2 <- as.data.frame(table(total_M_selected_variables_en_2$V1))
+table_en_2 <- table_en_2[order(table_en_2$Freq, decreasing = T),]
+rownames(table_en_2) <- 1:nrow(table_en_2)
+table_en_2$prob <- table_en_2$Freq/1000
+table_en_2 # probability of the different variables being selected to the top 10 most important variables considering the Elastic Net method 
+
+```
+
+Bellow see the barplot representation of the information contained in table_ridge_2, table_lasso_2 and table_en_2.
+
+```{r}
+
+# Variable Importance barplots Ridge
+pl1<-ggplot(table_ridge_2, aes(x=reorder(Var1, Freq), y=prob*100)) + 
+  geom_bar(stat = "identity", fill="black", colour="black", 
+               width=0.5) + theme_bw() +
+  theme(axis.text.x = element_text( vjust = 0.5, hjust=0.5),axis.text = element_text(size = 4)) + 
+  xlab(" ") + ylab(" ") + ggtitle("Ridge") +
+  coord_flip()+          
+      theme(aspect.ratio = 2)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(plot.margin = unit(c(0,0,0,0), "cm"),plot.title = element_text(hjust = 0.5,size = 7))
+
+# Variable Importance barplots LASSO
+pl2<-ggplot(table_lasso_2, aes(x=reorder(Var1, Freq), y=prob*100)) + 
+  geom_bar(stat = "identity", fill="black", colour="black", 
+               width=0.5) + theme_bw() +
+  theme(axis.text.x = element_text( vjust = 0.5, hjust=0.5),axis.text = element_text(size = 4)) + 
+  xlab(" ") + ylab(" ") + ggtitle("LASSO") +
+  coord_flip()+          
+      theme(aspect.ratio = 2)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(plot.margin = unit(c(0,0,0,0), "cm"),plot.title = element_text(hjust = 0.5,size = 7))
+
+# Variable Importance barplots Elastic Net
+pl3<-ggplot(table_en_2, aes(x=reorder(Var1, Freq), y=prob*100)) + 
+  geom_bar(stat = "identity", fill="black", colour="black", 
+               width=0.5) + theme_bw() +
+  theme(axis.text.x = element_text( vjust = 0.5, hjust=0.5),axis.text = element_text(size = 4)) + 
+  xlab(" ") + ylab(" ") + ggtitle("Elastic net") +
+  coord_flip()+          
+      theme(aspect.ratio = 2)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(plot.margin = unit(c(0,0,0,0), "cm"),plot.title = element_text(hjust = 0.5,size = 7))
+
+
+```
+
+```{r}
+
+pdf("C:/Users/regin/Dropbox/02 INVESTIGAÇÃO/00 Papers/01 Publicações/Artigos/Regularization methods - Clams/JournalStatTheoryPractice/Images/vi.pdf",width = 5,height = 6)
+grid.arrange(pl1, pl2, pl3, nrow = 1)
+dev.off()
+
+```
+
+
+# Residual Analysis
+
+We can undertook a residual as a measure of how close the estimated probability was to predicting the actual class.
+
+```{r}
+
+# RIDGE
+
+residuals_ridge <- list() # Ridge residuals
+
+for (i in 1:M) {
+  
+  res <- vector()
+  for (j in 1:24) {
+    if (y_train[[i]][j]=="G") {
+      res[j]=1-fit.ridge.pred.ra[[i]][j,1]
+    } else {
+      if (y_train[[i]][j]=="Rav") {
+        res[j]=1-fit.ridge.pred.ra[[i]][j,2]
+      }
+      else{
+        res[j]=1-fit.ridge.pred.ra[[i]][j,3]
+      }
+    }
+  }
+  residuals_ridge[[i]] <- res
+}
+
+
+# LASSO
+
+residuals_lasso <- list() # LASSO residuals
+
+for (i in 1:M) {
+  
+  res <- vector()
+  for (j in 1:24) {
+    if (y_train[[i]][j]=="G") {
+      res[j]=1-fit.lasso.pred.ra[[i]][j,1]
+    } else {
+      if (y_train[[i]][j]=="Rav") {
+        res[j]=1-fit.lasso.pred.ra[[i]][j,2]
+      }
+      else{
+        res[j]=1-fit.lasso.pred.ra[[i]][j,3]
+      }
+    }
+  }
+  residuals_lasso[[i]] <- res
+}
+
+
+# ELASTIC NET
+
+residuals_en <- list() # Elastic Net residuals
+
+for (i in 1:M) {
+
+  res <- vector()
+  for (j in 1:24) {
+    if (y_train[[i]][j]=="G") {
+      res[j]=1-fit.en.pred.ra[[i]][j,1]
+    } else {
+      if (y_train[[i]][j]=="Rav") {
+        res[j]=1-fit.en.pred.ra[[i]][j,2]
+      }
+      else{
+        res[j]=1-fit.en.pred.ra[[i]][j,3]
+      }
+    }
+  }
+  residuals_en[[i]] <- res
+}
+
+```
+
+For this analysis, we decided to merge the residuals of the 1000 models considering the different regularization methods applied. 
+
+```{r}
+
+total_residuals_ridge <- ldply(residuals_ridge,data.frame) # merged Ridge residuals
+total_residuals_lasso <- ldply(residuals_lasso,data.frame) # merged LASSO residuals
+total_residuals_en <- ldply(residuals_en,data.frame) # merged Elastic Net residuals
+
+# Combining the residuals of the 3 methods into one dataframe:
+df <- rbind(total_residuals_ridge,
+            total_residuals_lasso,
+            total_residuals_en) 
+method <- c(rep("Ridge",24000),
+            rep("LASSO",24000),
+            rep("Elastic Net",24000))
+df_residuals <- cbind(method, df)
+colnames(df_residuals) <- c("Method", "Residuals")
+
+```
+
+We studied the boxplots and density plots of the residuals of the different regularization methods applied.
+
+```{r}
+
+mu <- ddply(df_residuals, "Method", summarise, grp.mean=mean(Residuals)) # mean residual value for Ridge, LASSO and Elastic Net
+level_order <- c("Ridge", "LASSO", "Elastic Net") # to arrange the order in which the methods are displayed on the plots
+
+
+# Boxplot Residuals
+ggplot(df_residuals, aes(x=factor(Method, level = level_order),
+                         y=Residuals, group=Method)) + geom_boxplot() +
+  scale_color_manual(values = c("black")) +
+  ylab("Residuals") + xlab("") + theme_bw() +
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=22))
+
+# Density Residuals
+ggplot(df_residuals, aes(x=Residuals)) +
+  geom_density(size=1, aes(linetype=factor(Method, level = level_order)), 
+              key_glyph = draw_key_path) + 
+   scale_linetype_discrete("Method") +
+  # geom_vline(data = mu, aes(xintercept=grp.mean, linetype=Method), 
+             # size=0.5) + 
+  # geom_vline(xintercept=0.5, size = 1) + 
+  # scale_linetype_discrete("Method") +  
+  theme_bw() +
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=22),
+        legend.text = element_text(size=20),
+        legend.title = element_text(size=20))
+
+```
+
+Besides comparing the residual behavior between methods, we also studied how they varied between the three different classes of the response variable, conditioned to the regularization method.
+
+```{r}
+
+residuals_ridge_G <- list() # For each Ridge model, the residuals linked to "Ría de Vigo"
+residuals_ridge_Rav <- list() # For each Ridge model, the residuals linked to "Ria de Aveiro"
+residuals_ridge_T <- list() # For each Ridge model, the residuals linked to "Tagus Estuary"
+
+residuals_lasso_G <- list() # For each LASSO model, the residuals linked to "Ría de Vigo"
+residuals_lasso_Rav <- list() # For each LASSO model, the residuals linked to "Ria de Aveiro"
+residuals_lasso_T <- list() # For each LASSO model, the residuals linked to "Tagus Estuary"
+
+residuals_en_G <- list() # For each Elastic Net model, the residuals linked to "Ría de Vigo"
+residuals_en_Rav <- list() # For each Elastic Net model, the residuals linked to "Ria de Aveiro"
+residuals_en_T <- list() # For each Elastic Net model, the residuals linked to "Tagus Estuary"
+
+for (i in 1:M) {
+  
+  res_ridge_G <- vector()
+  res_ridge_Rav <- vector()
+  res_ridge_T <- vector()
+  
+  res_lasso_G <- vector()
+  res_lasso_Rav <- vector()
+  res_lasso_T <- vector()
+  
+  res_en_G <- vector()
+  res_en_Rav <- vector()
+  res_en_T <- vector()
+  
+  for (j in 1:24) {
+    if (y_train[[i]][j]=="G") {
+      res_ridge_G[j]=1-fit.ridge.pred.ra[[i]][j,1]
+      res_lasso_G[j]=1-fit.lasso.pred.ra[[i]][j,1]
+      res_en_G[j]=1-fit.en.pred.ra[[i]][j,1]
+    } else {
+      if (y_train[[i]][j]=="Rav") {
+        res_ridge_Rav[j]=1-fit.ridge.pred.ra[[i]][j,2]
+        res_lasso_Rav[j]=1-fit.lasso.pred.ra[[i]][j,2]
+        res_en_Rav[j]=1-fit.en.pred.ra[[i]][j,2]
+      }
+      else{
+        res_ridge_T[j]=1-fit.ridge.pred.ra[[i]][j,3]
+        res_lasso_T[j]=1-fit.lasso.pred.ra[[i]][j,3]
+        res_en_T[j]=1-fit.en.pred.ra[[i]][j,3]
+      }
+    }
+  }
+  residuals_ridge_G[[i]] <- as.numeric(na.omit(res_ridge_G))
+  residuals_ridge_Rav[[i]] <- as.numeric(na.omit(res_ridge_Rav))
+  residuals_ridge_T[[i]] <- as.numeric(na.omit(res_ridge_T))
+  
+  residuals_lasso_G[[i]] <- as.numeric(na.omit(res_lasso_G))
+  residuals_lasso_Rav[[i]] <- as.numeric(na.omit(res_lasso_Rav))
+  residuals_lasso_T[[i]] <- as.numeric(na.omit(res_lasso_T))
+  
+  residuals_en_G[[i]] <- as.numeric(na.omit(res_en_G))
+  residuals_en_Rav[[i]] <- as.numeric(na.omit(res_en_Rav))
+  residuals_en_T[[i]] <- as.numeric(na.omit(res_en_T))
+}
+
+```
+
+Again, we merged the residual results of the 1000 models. 
+
+```{r}
+
+TOTAL_residuals_ridge_G <- ldply(residuals_ridge_G,data.frame) # merged Ridge "Ría de Vigo" residuals
+TOTAL_residuals_ridge_Rav <- ldply(residuals_ridge_Rav,data.frame) # merged Ridge "Ria de Aveiro" residuals
+TOTAL_residuals_ridge_T <- ldply(residuals_ridge_T,data.frame) # merged Ridge "Tagus Estuary" residuals
+
+TOTAL_residuals_lasso_G <- ldply(residuals_lasso_G,data.frame) # merged LASSO "Ría de Vigo" residuals
+TOTAL_residuals_lasso_Rav <- ldply(residuals_lasso_Rav,data.frame) # merged LASSO "Ria de Aveiro" residuals
+TOTAL_residuals_lasso_T <- ldply(residuals_lasso_T,data.frame) # merged LASSO "Tagus Estuary" residuals
+
+TOTAL_residuals_en_G <- ldply(residuals_en_G,data.frame) # merged Elastic Net "Ría de Vigo" residuals
+TOTAL_residuals_en_Rav <- ldply(residuals_en_Rav,data.frame) # merged Elastic Net "Ria de Aveiro" residuals
+TOTAL_residuals_en_T <- ldply(residuals_en_T,data.frame) # merged Elastic Net "Tagus Estuary" residuals
+
+```
+
+In order to complete this analysis, for each regularization method, we combined the residual results of the different classes into one dataframe.
+
+```{r}
+
+# Ridge
+df_residuals_ridge <- rbind(TOTAL_residuals_ridge_G,
+                            TOTAL_residuals_ridge_Rav,
+                            TOTAL_residuals_ridge_T)
+class_ridge <- c(rep("G",nrow(TOTAL_residuals_ridge_G)),
+                 rep("Rav",nrow(TOTAL_residuals_ridge_Rav)),
+                 rep("T",nrow(TOTAL_residuals_ridge_T)))
+df_TOTAL_residuals_ridge <- cbind(class_ridge, df_residuals_ridge)
+colnames(df_TOTAL_residuals_ridge) <- c("Class", "Residuals")
+
+# LASSO
+df_residuals_lasso <- rbind(TOTAL_residuals_lasso_G,
+                            TOTAL_residuals_lasso_Rav,
+                            TOTAL_residuals_lasso_T)
+class_lasso <- c(rep("G",nrow(TOTAL_residuals_lasso_G)),
+                 rep("Rav",nrow(TOTAL_residuals_lasso_Rav)),
+                 rep("T",nrow(TOTAL_residuals_lasso_T)))
+df_TOTAL_residuals_lasso <- cbind(class_lasso, df_residuals_lasso)
+colnames(df_TOTAL_residuals_lasso) <- c("Class", "Residuals")
+
+# Elastic Net
+df_residuals_en <- rbind(TOTAL_residuals_en_G,
+                         TOTAL_residuals_en_Rav,
+                         TOTAL_residuals_en_T)
+class_en <- c(rep("G",nrow(TOTAL_residuals_en_G)),
+              rep("Rav",nrow(TOTAL_residuals_en_Rav)),
+              rep("T",nrow(TOTAL_residuals_en_T)))
+df_TOTAL_residuals_en <- cbind(class_en, df_residuals_en)
+colnames(df_TOTAL_residuals_en) <- c("Class", "Residuals")
+
+
+mu_ridge <- ddply(df_TOTAL_residuals_ridge, "Class", summarise, grp.mean=mean(Residuals)) # mean Ridge residual values for the different classes of the response variable
+mu_lasso <- ddply(df_TOTAL_residuals_lasso, "Class", summarise, grp.mean=mean(Residuals)) # mean LASSO residual values for the different classes of the response variable
+mu_en <- ddply(df_TOTAL_residuals_en, "Class", summarise, grp.mean=mean(Residuals)) # mean Elastic Net residual values for the different classes of the response variable
+
+```
+
+Bellow see the residual Boxplots and density plots of the different classes of the response variable, conditioned to the regularization method.
+
+```{r}
+
+# Boxplot Residuals - Ridge
+ggplot(df_TOTAL_residuals_ridge, aes(x=Class, y=Residuals)) + 
+  geom_boxplot() + theme_bw() + xlab("") +
+  scale_color_manual(values = c("black")) +
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=22)) +
+  scale_x_discrete(labels=c("G" = "RV", "Rav" = "RAv",
+                            "T" = "TE"))
+
+# Density Residuals - Ridge
+ggplot(df_TOTAL_residuals_ridge, aes(x = Residuals)) +
+  geom_density(size=1, aes(linetype = Class), key_glyph = draw_key_path) + 
+   scale_linetype_discrete("Class", labels = c("RV", "RAv", "TE")) +
+  # geom_vline(data=mu_ridge, aes(xintercept=grp.mean, linetype=Class),
+             # size=0.5) + 
+  # geom_vline(xintercept=0.5, size = 1) + 
+  theme_bw() +
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=22),
+        legend.text = element_text(size=20),
+        legend.title = element_text(size=20))
+
+# Boxplot Residuals - LASSO
+ggplot(df_TOTAL_residuals_lasso, aes(x=Class, y=Residuals)) + 
+  geom_boxplot() + theme_bw() + xlab("") +
+  scale_color_manual(values = c("black")) +
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=22)) +
+  scale_x_discrete(labels=c("G" = "RV", "Rav" = "RAv",
+                            "T" = "TE"))
+
+# Density Residuals - LASSO
+ggplot(df_TOTAL_residuals_lasso, aes(x = Residuals)) +
+  geom_density(size=1, aes(linetype = Class), 
+              key_glyph = draw_key_path) + 
+  scale_linetype_discrete("Class", labels = c("RV", "RAv", "TE")) + 
+  # geom_vline(data=mu_lasso, aes(xintercept=grp.mean, linetype=Class),
+             # size=0.5) + 
+  # geom_vline(xintercept=0.5, size = 1) + 
+  theme_bw() +
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=22),
+        legend.text = element_text(size=20),
+        legend.title = element_text(size=20))
+
+# Boxplot Residuals - Elastic Net
+ggplot(df_TOTAL_residuals_en, aes(x=Class, y=Residuals)) + 
+  geom_boxplot() + theme_bw() + xlab("") +
+  scale_color_manual(values = c("black")) +
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=22)) +
+  scale_x_discrete(labels=c("G" = "RV", "Rav" = "RAv",
+                            "T" = "TE"))
+
+# Density Residuals - Elastic Net
+ggplot(df_TOTAL_residuals_en, aes(x = Residuals)) +
+  geom_density(size=1, aes(linetype = Class), 
+              key_glyph = draw_key_path) + 
+   scale_linetype_discrete("Class", labels = c("RV", "RAv", "TE")) + 
+  # geom_vline(data=mu_en, aes(xintercept=grp.mean, linetype=Class),
+             # size=0.5) + 
+  # geom_vline(xintercept=0.5, size = 1) + 
+  theme_bw() +
+  theme(axis.text=element_text(size=20),
+        axis.title=element_text(size=22),
+        legend.text = element_text(size=20),
+        legend.title = element_text(size=20))
+
+```
+
